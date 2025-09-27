@@ -1,16 +1,69 @@
-#include "FBLed.h"
+/*
+ * nRF24L01 子控制器 - 基于Main(2).ino
+ * 负责接收主控制器的数据，实现数据同步
+ * 
+ * 硬件连接：
+ * nRF24L01模块：
+ * - VCC → 3.3V (注意：不是5V！)
+ * - GND → GND
+ * - CE → 数字引脚7
+ * - CSN → 数字引脚8
+ * - SCK → 数字引脚13
+ * - MOSI → 数字引脚11
+ * - MISO → 数字引脚12
+ */
 
+#include "FBLed.h"
 #include <stdio.h>
 #include <Servo.h>
 #include "myButton.h"
 #include <KeyValueEEPROM.h>
 #include <EEPROM.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
 Servo myservo;
 
 FBLed led1;
 FBLed led2;
 FBLed led3;
 
+// nRF24L01配置
+RF24 radio(16, 17); // CE=16, CSN=17 (使用数字引脚，性能最佳)
+const byte addresses[][6] = {"00001", "00002"}; // 主控制器地址和子控制器地址
+
+// 数据同步结构体
+struct SyncData {
+  bool motorSw;
+  bool steerSw;
+  int SteerLeftTimeFlag;
+  int motorSwFlag;
+  int motorSpeed;
+  int steerSpeed;
+  int steerInterval;
+  float steerAngle;
+  float steerLVal;
+  float steerRVal;
+  float steerNowVal;
+  int steerLTime;
+  int steerRTime;
+  int steerLTimeAction;
+  int steerRTimeAction;
+  int steerMidVal;
+  int steerAngle_show;
+  int ecCnt[5]; // 编码器计数
+  uint32_t timestamp; // 时间戳
+  uint8_t checksum; // 校验和
+};
+
+// 配对状态
+bool isPaired = false;
+bool pairingMode = false;
+unsigned long lastPairingTime = 0;
+unsigned long lastSyncTime = 0;
+const unsigned long SYNC_TIMEOUT = 5000; // 5秒同步超时
+const unsigned long PAIRING_TIMEOUT = 10000; // 10秒配对超时
 
 #define MIN_ANGLE 0
 #define MAX_ANGLE  300
@@ -20,14 +73,12 @@ FBLed led3;
 
 #define bt1 31  // record param
 #define bt2 33  // steer sw
-#define bt3 35  //
+#define bt3 35  // 配对按钮
 #define bt4 37
 #define bt5 39 // motor sw
 
 #define now_count 0
 #define total_count 100*k
-
-
 
 #define MotorPwmPin 7  // 电机pwm输出引脚
 #define MotorIN1Pin 6  // 电机IN1控制引脚
@@ -38,27 +89,22 @@ FBLed led3;
 
 //编码器 0 引脚定义
 int CLK0 = 2;
-int DT0 = 11;
+int DT0 = 22;  // 从11改为22，避免与nRF24L01 MOSI冲突
 
 float k = 0.30; //时长系数
 //编码器 1 引脚定义
 int CLK1 = 3;
-int DT1 = 12;
-
-
+int DT1 = 23;  // 从12改为23，避免与nRF24L01 MISO冲突
 
 //编码器 2 引脚定义
 int CLK2 = 21;
-int DT2 = 13;
-
-
+int DT2 = 24;  // 从13改为24，避免与nRF24L01 SCK冲突
 
 //编码器 3 引脚定义
 int CLK3 = 20;
 int DT3 = 14;
 //编码器 4 引脚定义
 int CLK4 = 19;
-
 
 int CLK3_value = 1;
 int DT3_value = 1;
@@ -99,6 +145,7 @@ int addr161 = 21;
 int addr17 = 22;
 int addr18 = 23;
 int DT20 = 15;
+
 // 系统相关的参数表
 typedef struct
 {
@@ -124,8 +171,7 @@ typedef struct
 
 } param_t;
 
-
-////舵机控制状态值
+//舵机控制状态值
 typedef enum
 {
   LEFT_STOP = 0,
@@ -142,7 +188,7 @@ char ledBuf[8];
 // 按键定义
 GpioButton myBt1(bt1);  // record param
 GpioButton myBt2(bt2); // steer sw
-GpioButton myBt3(bt3);
+GpioButton myBt3(bt3); // 配对按钮
 GpioButton myBt4(bt4);
 GpioButton myBt5(bt5);// motor sw
 
@@ -169,12 +215,7 @@ void CoderInit(void)
   attachInterrupt(2, ClockChanged2, CHANGE);//设置中断0的处理函数，电平变化触发
   attachInterrupt(3, ClockChanged3, CHANGE);//设置中断0的处理函数，电平变化触发
   attachInterrupt(4, ClockChanged4, CHANGE);//设置中断0的处理函数，电平变化触发
-
-  //memset(ecCnt,0,5);
 }
-
-
-
 
 //按键初始化
 void BtInit(void)
@@ -213,39 +254,30 @@ void BtInit(void)
     Serial.println( EEPROM.read(addr111));
     Serial.println( EEPROM.read(200));
 
-    //     EEPROM.write(addr13, Val.steerInterval);
-
-    //     EEPROM.write(addr16, Val.steerLTimeAction);
-    //     EEPROM.write(addr17, Val.steerRTime);
     EEPROM.write(addr18, Val.steerAngle_show);
-
     EEPROM.write(200, 1);
   });
+  
+  myBt2.BindBtnPress([]() {
+    // 子控制器按钮按下时发送同步请求
+    requestDataSync();
+  });
+  
+  myBt3.BindBtnPress([]() {
+    // 配对按钮
+    startPairing();
+  });
+
   myBt4.BindBtnPress([]() {
     if (Val.steerSw) {
       Val.steerSw = false;
     } else {
       Val.steerSw = true;
     }
-    //    Serial.print("steer sw :");
-    //    Serial.println(Val.steerSw);
+    // 发送同步请求
+    requestDataSync();
   });
 
-  myBt3.BindBtnPress([]() {
-
-    if (Val.SteerLeftTimeFlag == 0) {
-      Val.SteerLeftTimeFlag = 1;
-      ecCnt[2] = map(Val.steerRTime, 0, 25, 0, 198);
-    } else if (Val.SteerLeftTimeFlag == 1) {
-      Val.SteerLeftTimeFlag = 2;
-      ecCnt[2] = map(Val.steerLTime, 0, 25, 0, 198);
-    } else if (Val.SteerLeftTimeFlag == 2) {
-      Val.SteerLeftTimeFlag = 0;
-    } else {
-      Val.SteerLeftTimeFlag = 0;
-    }
-
-  });
   myBt5.BindBtnPress([]() {
     Val.motorSwFlag++;
     if (Val.motorSwFlag > 1)
@@ -258,11 +290,10 @@ void BtInit(void)
     } else {
       Val.motorSw = true;
     }
-    //    Serial.print("motor swflag :");
-    //    Serial.println(Val.motorSwFlag);
+    // 发送同步请求
+    requestDataSync();
   });
 }
-
 
 //按键循环查询 以及 系统参数更新
 void BtLoop(void)
@@ -284,7 +315,6 @@ void BtLoop(void)
     Val.steerAngle_show = map(sensorValue, 0, 198, 0, 99);
     //摆幅数值映射
 
-
     Val.steerAngle = map(sensorValue, 0, 198, MIN_ANGLE, MAX_ANGLE);
     //摆动速度是加速度除以4
     Val.steerSpeed = ecCnt[1] / 4;
@@ -298,18 +328,12 @@ void BtLoop(void)
     else if (Val.SteerLeftTimeFlag == 1)
     {
       sensorValue = ecCnt[2];
-      Val.steerRTime = map(sensorValue, 0, 198
-                           , 0, 25);
+      Val.steerRTime = map(sensorValue, 0, 198, 0, 25);
       Val.steerRTimeAction = Val.steerRTime * 100;
     }
-    //        Serial.print("左：");
-    //        Serial.print(Val.steerLTimeAction);
-    //        Serial.print("右:");
-    //        Serial.println(Val.steerRTimeAction);
+    
     sensorValue = ecCnt[3];
-
     //中位点位置是旋钮值除以2+最小值
-
     Val.steerMidVal = sensorValue + MIN_MID;
 
     Val.steerLVal = Val.steerMidVal - Val.steerAngle;
@@ -324,13 +348,11 @@ void BtLoop(void)
     //电机速度
     Val.motorSpeed = ecCnt[4] / 2;
   }
-
 }
 
 // 数码管输出画
 void LedInit(void)
 {
-
   led1.begin(36, 34, 32); // 初始化数码管1
   led2.begin(26, 24, 22); // 初始化数码管2
   led3.begin(46, 44, 42); // 初始化数码管3
@@ -365,7 +387,6 @@ void MotorInit(void)
   pinMode(MotorIN3Pin, OUTPUT);
 }
 
-
 //电机循环控制
 void MotorLoop(void)
 {
@@ -386,7 +407,6 @@ void MotorLoop(void)
     analogWrite(MotorPwmPin, outputValue); // 500Hz
   }
 }
-
 
 //舵机初始化
 void SteerInit(void)
@@ -421,10 +441,6 @@ void SteerInit(void)
     int a3 = EEPROM.read(addr11);
     int a4 = EEPROM.read(addr111);
     Val.steerMidVal = a4 * 100 + a3;
-    //    Val.steerNowVal= EEPROM.read(addr12);
-    //    Val.steerInterval= EEPROM.read(addr13);
-    //    Val.steerLVal= EEPROM.read(addr14);
-    //    Val.steerRVal= EEPROM.read(addr15);
     Val.steerLTimeAction = Val.steerLTime * 100;
     Val.steerRTimeAction = Val.steerRTime * 100;
     Val.steerAngle_show = EEPROM.read(addr18);
@@ -452,9 +468,7 @@ void SteerInit(void)
     Val.steerLTimeAction = Val.steerLTime * 100;
     Val.steerRTimeAction = Val.steerRTime * 100;
   }
-
 }
-
 
 //舵机循环控制
 void SteerLoop(void)
@@ -475,13 +489,7 @@ void SteerLoop(void)
         float count = (100 - Val.steerSpeed) * k;
         //速度
         float v = Val.steerAngle / count;
-        //        Serial.print("当前状态：");
-        //        Serial.print(Val.steerAngle);
-        //        Serial.print("总时间:");
-        //        Serial.print(t);
-        //        Serial.print(",");
-        //        Serial.print("速度:");
-        //        Serial.println(v);
+        
         switch (steerStaue)
         {
           case LEFT_STOP:
@@ -497,8 +505,6 @@ void SteerLoop(void)
             Val.steerNowVal = Val.steerNowVal - v;
             if (Val.steerNowVal <= Val.steerLVal || Val.steerNowVal >= MAX_MID || Val.steerNowVal <= MIN_MID)
             {
-              //            Serial.print("当前角度:");
-              //            Serial.println(Val.steerNowVal);
               //如果当前的角度 小于等于左边最大的摆幅
               //停止左转
               steerStaue = LEFT_STOP;
@@ -519,8 +525,6 @@ void SteerLoop(void)
 
             if (Val.steerNowVal >= Val.steerRVal || Val.steerNowVal <= MIN_MID || Val.steerNowVal >= MAX_MID)
             {
-              //              Serial.print("当前角度:");
-              //              Serial.println(Val.steerNowVal);
               steerStaue = RIGHT_STOP;
               Val.steerNowVal = Val.steerRVal;
               lastSTime = nowTime;
@@ -543,6 +547,200 @@ void SteerLoop(void)
   }
 }
 
+// nRF24L01初始化
+void RadioInit(void)
+{
+  radio.begin();
+  radio.setChannel(76);
+  radio.setDataRate(RF24_1MBPS);
+  radio.setPALevel(RF24_PA_HIGH);
+  radio.setRetries(15, 15);
+  
+  // 设置接收地址
+  radio.openWritingPipe(addresses[0]); // 发送到主控制器
+  radio.openReadingPipe(1, addresses[1]); // 监听自己的地址
+  
+  radio.startListening();
+  
+  Serial.println("nRF24L01 子控制器初始化完成");
+}
+
+// 开始配对
+void startPairing(void)
+{
+  pairingMode = true;
+  lastPairingTime = millis();
+  Serial.println("开始配对模式...");
+  
+  // 发送配对请求
+  sendPairingRequest();
+}
+
+// 发送配对请求
+void sendPairingRequest(void)
+{
+  SyncData pairingData;
+  pairingData.timestamp = millis();
+  pairingData.checksum = 0xAA; // 配对标识
+  
+  radio.stopListening();
+  bool success = radio.write(&pairingData, sizeof(pairingData));
+  radio.startListening();
+  
+  if (success) {
+    Serial.println("配对请求已发送");
+  } else {
+    Serial.println("配对请求发送失败");
+  }
+}
+
+// 请求数据同步
+void requestDataSync(void)
+{
+  if (isPaired) {
+    SyncData requestData;
+    requestData.timestamp = millis();
+    requestData.checksum = 0xBB; // 同步请求标识
+    
+    radio.stopListening();
+    bool success = radio.write(&requestData, sizeof(requestData));
+    radio.startListening();
+    
+    if (success) {
+      Serial.println("数据同步请求已发送");
+    } else {
+      Serial.println("数据同步请求发送失败");
+    }
+  }
+}
+
+// 处理接收到的数据
+void processReceivedData(void)
+{
+  if (radio.available()) {
+    SyncData receivedData;
+    radio.read(&receivedData, sizeof(receivedData));
+    
+    // 验证数据包
+    if (validateSyncData(&receivedData)) {
+      // 更新本地参数
+      updateLocalParameters(&receivedData);
+      lastSyncTime = millis();
+      Serial.println("数据同步成功");
+    } else {
+      Serial.println("数据包验证失败");
+    }
+  }
+}
+
+// 验证同步数据
+bool validateSyncData(SyncData* data)
+{
+  // 检查校验和
+  uint8_t calculatedChecksum = calculateChecksum(data);
+  if (data->checksum != calculatedChecksum) {
+    return false;
+  }
+  
+  // 检查时间戳（防止旧数据）
+  if (millis() - data->timestamp > 10000) { // 10秒超时
+    return false;
+  }
+  
+  return true;
+}
+
+// 更新本地参数
+void updateLocalParameters(SyncData* data)
+{
+  Val.motorSw = data->motorSw;
+  Val.steerSw = data->steerSw;
+  Val.SteerLeftTimeFlag = data->SteerLeftTimeFlag;
+  Val.motorSwFlag = data->motorSwFlag;
+  Val.motorSpeed = data->motorSpeed;
+  Val.steerSpeed = data->steerSpeed;
+  Val.steerInterval = data->steerInterval;
+  Val.steerAngle = data->steerAngle;
+  Val.steerLVal = data->steerLVal;
+  Val.steerRVal = data->steerRVal;
+  Val.steerNowVal = data->steerNowVal;
+  Val.steerLTime = data->steerLTime;
+  Val.steerRTime = data->steerRTime;
+  Val.steerLTimeAction = data->steerLTimeAction;
+  Val.steerRTimeAction = data->steerRTimeAction;
+  Val.steerMidVal = data->steerMidVal;
+  Val.steerAngle_show = data->steerAngle_show;
+  
+  // 更新编码器数据
+  for (int i = 0; i < 5; i++) {
+    ecCnt[i] = data->ecCnt[i];
+  }
+}
+
+// 计算校验和
+uint8_t calculateChecksum(SyncData* data)
+{
+  uint8_t checksum = 0;
+  uint8_t* ptr = (uint8_t*)data;
+  
+  // 计算除校验和字段外的所有字节
+  for (int i = 0; i < sizeof(SyncData) - sizeof(uint8_t); i++) {
+    checksum ^= ptr[i];
+  }
+  
+  return checksum;
+}
+
+// 检查配对响应
+void checkPairingResponse(void)
+{
+  if (pairingMode && radio.available()) {
+    SyncData response;
+    radio.read(&response, sizeof(response));
+    
+    if (response.checksum == 0xAA) { // 配对请求
+      // 发送配对确认
+      sendPairingConfirmation();
+      isPaired = true;
+      pairingMode = false;
+      Serial.println("配对成功！");
+    }
+  }
+  
+  // 检查配对超时
+  if (pairingMode && (millis() - lastPairingTime > PAIRING_TIMEOUT)) {
+    pairingMode = false;
+    Serial.println("配对超时");
+  }
+}
+
+// 发送配对确认
+void sendPairingConfirmation(void)
+{
+  SyncData confirmation;
+  confirmation.timestamp = millis();
+  confirmation.checksum = 0x55; // 配对确认标识
+  
+  radio.stopListening();
+  bool success = radio.write(&confirmation, sizeof(confirmation));
+  radio.startListening();
+  
+  if (success) {
+    Serial.println("配对确认已发送");
+  } else {
+    Serial.println("配对确认发送失败");
+  }
+}
+
+// 检查同步超时
+void checkSyncTimeout(void)
+{
+  if (isPaired && (millis() - lastSyncTime > SYNC_TIMEOUT)) {
+    Serial.println("同步超时，请求重新同步");
+    requestDataSync();
+  }
+}
+
 //系统初始化
 void setup()
 {
@@ -552,21 +750,28 @@ void setup()
   MotorInit();
   SteerInit();
   CoderInit();
-  //  Serial.println("Init ok");
-
+  RadioInit();
+  
+  Serial.println("=== nRF24L01 子控制器启动 ===");
+  Serial.println("按bt3开始配对");
 }
 
 //系统循环处理
 void loop()
 {
-
   BtLoop();
   LedShow();
-  //MotorLoop();
   SteerLoop();
+  
+  // 处理接收到的数据
+  processReceivedData();
+  
+  // 检查配对响应
+  checkPairingResponse();
+  
+  // 检查同步超时
+  checkSyncTimeout();
 }
-
-
 
 //中断处理函数
 void ClockChanged0()
@@ -594,11 +799,10 @@ void ClockChanged0()
   }
   CLK0_value = clkValue;
   DT0_value = dtValue;
-  //  Serial.print("0 -- ");
-  //  Serial.println(ecCnt[0]);
-
+  
+  // 发送同步请求
+  requestDataSync();
 }
-
 
 void ClockChanged1()
 {
@@ -626,10 +830,12 @@ void ClockChanged1()
   CLK1_value = clkValue;
   DT1_value = dtValue;
 
-    Serial.print("1 -- ");
-    Serial.println(ecCnt[1]);
+  Serial.print("1 -- ");
+  Serial.println(ecCnt[1]);
+  
+  // 发送同步请求
+  requestDataSync();
 }
-
 
 void ClockChanged2()
 {
@@ -656,8 +862,11 @@ void ClockChanged2()
   }
   CLK2_value = clkValue;
   DT2_value = dtValue;
-    Serial.print("2 -- ");
-    Serial.println(ecCnt[2]);
+  Serial.print("2 -- ");
+  Serial.println(ecCnt[2]);
+  
+  // 发送同步请求
+  requestDataSync();
 }
 
 void ClockChanged3()
@@ -685,8 +894,9 @@ void ClockChanged3()
   }
   CLK3_value = clkValue;
   DT3_value = dtValue;
-
-
+  
+  // 发送同步请求
+  requestDataSync();
 }
 
 void ClockChanged4()
@@ -714,6 +924,10 @@ void ClockChanged4()
   }
   CLK4_value = clkValue;
   DT4_value = dtValue;
-    Serial.print("4 -- ");
-    Serial.println(ecCnt[4]);
+  Serial.print("4 -- ");
+  Serial.println(ecCnt[4]);
+  
+  // 发送同步请求
+  requestDataSync();
 }
+
