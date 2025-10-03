@@ -1,169 +1,175 @@
 /*
- * ESP32 串口通信版
- * 功能：与Mega2560进行串口通信，不包含WiFi功能
- * 避免WiFi导致的重启问题
+ * ESP32串口通信版
+ * 功能：使用串口进行ESP32间通信
+ * 特点：最简单可靠，不需要WiFi或蓝牙
  */
 
 // 串口配置
-#define MEGA_TX_PIN 16     // ESP32 TX
-#define MEGA_RX_PIN 17     // ESP32 RX
-#define STATUS_LED_PIN 2   // 状态指示
+#define SERIAL_BAUD 115200
+#define SERIAL_TIMEOUT 1000
 
-// 在ESP32上使用Serial2与Mega2560通信
-#define megaSerial Serial2
-
-// 系统状态
-bool megaConnected = false;
+// 全局变量
 unsigned long lastHeartbeat = 0;
-unsigned long lastDataSync = 0;
-
-// 数据缓存
-String lastMasterData = "";
-String lastSlaveData = "";
-unsigned long lastMasterUpdate = 0;
-unsigned long lastSlaveUpdate = 0;
+int messageCount = 0;
+String inputBuffer = "";
 
 void setup() {
-  // 先初始化调试串口
-  Serial.begin(115200);
-  delay(100);
-  
-  Serial.println("==========================================");
-  Serial.println("ESP32 串口通信版启动");
-  Serial.println("==========================================");
-  
-  // 初始化引脚
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, LOW);
-  
-  // 初始化与Mega2560的通信
-  megaSerial.begin(115200, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
-  
-  // 等待启动完成
+  // 初始化串口
+  Serial.begin(SERIAL_BAUD);
+  Serial.setTimeout(SERIAL_TIMEOUT);
   delay(2000);
   
-  Serial.println("ESP32串口通信版初始化完成！");
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("ESP32串口通信版");
+  Serial.println("==========================================");
   
-  // 发送初始化响应
-  megaSerial.println("ESP32_READY");
-  Serial.println("发送ESP32_READY到Mega2560");
+  // 显示系统信息
+  displaySystemInfo();
   
-  // 等待Mega2560响应
-  unsigned long timeout = millis() + 10000;
-  while (millis() < timeout) {
-    if (megaSerial.available()) {
-      String response = megaSerial.readStringUntil('\n');
-      response.trim();
-      
-      Serial.println("收到Mega2560消息: " + response);
-      
-      if (response == "INIT_MASTER" || response == "SLAVE_READY") {
-        megaConnected = true;
-        digitalWrite(STATUS_LED_PIN, HIGH);
-        Serial.println("Mega2560连接成功！");
-        break;
-      }
-    }
-    delay(100);
-  }
+  // 初始化GPIO
+  pinMode(2, OUTPUT); // 内置LED
   
-  if (!megaConnected) {
-    Serial.println("Mega2560连接超时！");
-  }
+  Serial.println("==========================================");
+  Serial.println("串口通信系统初始化完成！");
+  Serial.println("波特率: " + String(SERIAL_BAUD));
+  Serial.println("==========================================");
+  Serial.println();
+  Serial.println("可用命令:");
+  Serial.println("  test - 发送测试消息");
+  Serial.println("  ping - 发送Ping");
+  Serial.println("  status - 获取状态信息");
+  Serial.println("  heartbeat - 发送心跳");
+  Serial.println("==========================================");
 }
 
 void loop() {
-  // 处理与Mega2560的通信
-  handleMegaCommunication();
+  // 处理串口输入
+  handleSerialInput();
   
   // 发送心跳
   sendHeartbeat();
   
-  // 同步数据
-  syncData();
+  // 发送测试消息
+  sendTestMessages();
   
-  delay(10);
+  // 闪烁LED
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 1000) {
+    lastBlink = millis();
+    digitalWrite(2, !digitalRead(2));
+  }
+  
+  // 显示状态信息
+  showStatus();
+  
+  delay(100);
 }
 
-// 处理Mega2560通信
-void handleMegaCommunication() {
-  if (megaSerial.available()) {
-    String data = megaSerial.readStringUntil('\n');
-    data.trim();
+// 显示系统信息
+void displaySystemInfo() {
+  Serial.println("系统信息:");
+  Serial.print("  芯片型号: ");
+  Serial.println(ESP.getChipModel());
+  Serial.print("  可用内存: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  Serial.print("  CPU温度: ");
+  Serial.print(temperatureRead());
+  Serial.println("°C");
+  Serial.println();
+}
+
+// 处理串口输入
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
     
-    Serial.println("收到Mega2560数据: " + data);
-    
-    // 处理不同类型的数据
-    if (data.startsWith("MASTER_DATA:")) {
-      handleMasterData(data);
-    } else if (data.startsWith("SLAVE_STATUS:") || data.startsWith("SLAVE_DATA:")) {
-      handleSlaveData(data);
-    } else if (data == "INIT_MASTER" || data == "SLAVE_READY") {
-      megaConnected = true;
-      digitalWrite(STATUS_LED_PIN, HIGH);
-      Serial.println("Mega2560重新连接成功！");
+    if (c == '\n' || c == '\r') {
+      if (inputBuffer.length() > 0) {
+        processCommand(inputBuffer);
+        inputBuffer = "";
+      }
+    } else {
+      inputBuffer += c;
     }
   }
 }
 
-// 处理主设备数据
-void handleMasterData(String data) {
-  lastMasterData = data;
-  lastMasterUpdate = millis();
+// 处理命令
+void processCommand(String command) {
+  command.trim();
+  Serial.println("收到命令: " + command);
+  messageCount++;
   
-  Serial.println("处理主设备数据: " + data);
-  
-  // 这里可以添加数据处理逻辑
-  // 例如：解析数据、存储到EEPROM等
-}
-
-// 处理从设备数据
-void handleSlaveData(String data) {
-  lastSlaveData = data;
-  lastSlaveUpdate = millis();
-  
-  Serial.println("处理从设备数据: " + data);
-  
-  // 这里可以添加数据处理逻辑
+  if (command == "test") {
+    Serial.println("test_response: 测试成功 from ESP32");
+  } else if (command == "ping") {
+    Serial.println("pong: " + String(millis()) + " from ESP32");
+  } else if (command == "status") {
+    String status = "status_response: memory=" + String(ESP.getFreeHeap()) + 
+                   ", temp=" + String(temperatureRead()) + 
+                   ", uptime=" + String(millis() / 1000) +
+                   ", messages=" + String(messageCount);
+    Serial.println(status);
+  } else if (command == "heartbeat") {
+    Serial.println("heartbeat_response: " + String(millis()) + " from ESP32");
+  } else if (command == "help") {
+    Serial.println("可用命令: test, ping, status, heartbeat, help");
+  } else {
+    Serial.println("echo: " + command);
+  }
 }
 
 // 发送心跳
 void sendHeartbeat() {
-  if (millis() - lastHeartbeat > 5000) { // 每5秒发送一次
-    if (megaConnected) {
-      megaSerial.println("ESP32_HEARTBEAT");
-      Serial.println("发送心跳到Mega2560");
-    }
+  if (millis() - lastHeartbeat > 10000) { // 每10秒发送一次
     lastHeartbeat = millis();
+    
+    String heartbeat = "heartbeat: " + String(millis()) + " from ESP32";
+    Serial.println(heartbeat);
   }
 }
 
-// 同步数据
-void syncData() {
-  if (millis() - lastDataSync > 1000) { // 每1秒同步一次
-    // 检查主设备数据是否需要同步
-    if (lastMasterData.length() > 0 && millis() - lastMasterUpdate < 5000) {
-      Serial.println("主设备数据同步: " + lastMasterData);
-    }
+// 发送测试消息
+void sendTestMessages() {
+  static unsigned long lastTest = 0;
+  if (millis() - lastTest > 30000) { // 每30秒发送一次
+    lastTest = millis();
     
-    // 检查从设备数据是否需要同步
-    if (lastSlaveData.length() > 0 && millis() - lastSlaveUpdate < 5000) {
-      Serial.println("从设备数据同步: " + lastSlaveData);
-    }
+    static int testIndex = 0;
+    String testMessages[] = {"test: message " + String(testIndex), 
+                            "ping: " + String(millis()),
+                            "status: request"};
     
-    lastDataSync = millis();
+    String testMessage = testMessages[testIndex % 3];
+    Serial.println(testMessage);
+    testIndex++;
   }
 }
 
-// 获取连接状态
-bool isMegaConnected() {
-  return megaConnected;
-}
-
-// 获取系统状态
-String getSystemStatus() {
-  String status = "Mega: " + String(megaConnected ? "已连接" : "未连接") + 
-                  ", 主设备数据: " + String(lastMasterData.length() > 0 ? "有" : "无") +
-                  ", 从设备数据: " + String(lastSlaveData.length() > 0 ? "有" : "无");
-  return status;
+// 显示状态信息
+void showStatus() {
+  static unsigned long lastStatusDisplay = 0;
+  
+  if (millis() - lastStatusDisplay > 30000) { // 每30秒显示一次
+    lastStatusDisplay = millis();
+    
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("串口通信状态");
+    Serial.println("==========================================");
+    
+    Serial.println("通信状态:");
+    Serial.println("  消息计数: " + String(messageCount));
+    Serial.println("  波特率: " + String(SERIAL_BAUD));
+    
+    Serial.println("系统状态:");
+    Serial.println("  可用内存: " + String(ESP.getFreeHeap()) + " bytes");
+    Serial.println("  CPU温度: " + String(temperatureRead()) + "°C");
+    Serial.println("  运行时间: " + String(millis() / 1000) + " 秒");
+    
+    Serial.println("==========================================");
+    Serial.println();
+  }
 }
